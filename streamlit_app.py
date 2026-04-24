@@ -9,6 +9,7 @@ Cloud-safe version:
 
 import sys
 import time
+import tempfile
 from pathlib import Path
 from collections import deque
 
@@ -83,6 +84,13 @@ def init_state():
         "frame_idx": 0, "start_time": None,
         "show_heatmap": False, "show_track_ids": True,
         "conf_threshold": 0.40, "cap": None,
+        # NEW: source routing
+        "source_mode": "ASU Live (best-effort)",
+        "custom_url": "",
+        "uploaded_video_path": None,
+        "use_tracker": True,
+        "target_fps": 1,
+        "window_sec": 60,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -97,45 +105,178 @@ def load_model():
     return YOLO(MODEL_NAME)
 
 
-def try_live_stream(url: str):
-    """Attempt to grab one frame from ASU live stream."""
+def _fetch_url_bytes(url: str, timeout: int = 8) -> bytes | None:
+    """HTTP GET with ASU-friendly headers; returns bytes or None."""
     try:
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, context=ctx, timeout=timeout) as r:
+            return r.read()
+    except Exception:
+        return None
+
+
+def _decode_image_bytes(data: bytes) -> np.ndarray | None:
+    try:
+        arr = np.frombuffer(data, np.uint8)
+        return cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    except Exception:
+        return None
+
+
+def _is_stream_url(url: str) -> bool:
+    """True if the URL looks like a video stream (HLS/DASH/MP4/TS/RTSP)."""
+    if not url:
+        return False
+    path = url.lower().split("?", 1)[0]
+    if url.lower().startswith(("rtsp://", "rtmp://")):
+        return True
+    return any(path.endswith(ext) for ext in (".m3u8", ".mpd", ".mp4", ".ts", ".m4s"))
+
+
+def _get_or_open_stream_cap(url: str) -> cv2.VideoCapture | None:
+    """
+    Cache a VideoCapture per URL in session state so we don't reconnect
+    (and re-download the manifest + init segment) on every fragment tick.
+    """
+    key = f"_stream_cap::{url}"
+    cap = st.session_state.get(key)
+    if cap is not None and cap.isOpened():
+        return cap
+    try:
+        new_cap = cv2.VideoCapture(url)
+        if not new_cap.isOpened():
+            new_cap.release()
+            return None
+        st.session_state[key] = new_cap
+        return new_cap
+    except Exception:
+        return None
+
+
+def fetch_frame_from_url(url: str) -> np.ndarray | None:
+    """
+    Fetch one frame from a URL. Handles:
+      - direct JPEG/PNG/WEBP endpoints (one HTTP GET, decoded with cv2.imdecode)
+      - HLS (.m3u8), DASH (.mpd), MP4, TS, RTSP (cached VideoCapture, one read per tick)
+    """
+    if not url:
+        return None
+    if _is_stream_url(url):
+        cap = _get_or_open_stream_cap(url)
+        if cap is None:
+            return None
+        ret, frame = cap.read()
+        if ret:
+            return frame
+        # Stream may have stalled/ended — drop the cached cap so next tick reopens.
+        key = f"_stream_cap::{url}"
+        try:
+            cap.release()
+        except Exception:
+            pass
+        st.session_state.pop(key, None)
+        return None
+    # Otherwise treat as a still-image URL
+    data = _fetch_url_bytes(url)
+    if data is None:
+        return None
+    return _decode_image_bytes(data)
+
+
+def try_live_stream(page_url: str) -> np.ndarray | None:
+    """
+    Best-effort ASU live-cam fetch. The ASU Views site is a JS SPA, so the
+    image URL is usually injected client-side and won't appear in static HTML.
+    We still try a handful of regex patterns — if the page ever serves a
+    direct <img> or stream URL, we'll grab a frame from it.
+    """
+    try:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        req = urllib.request.Request(page_url, headers={"User-Agent": "Mozilla/5.0"})
         with urllib.request.urlopen(req, context=ctx, timeout=8) as r:
             html = r.read().decode("utf-8", errors="ignore")
-        for pat in [r'(https?://[^\s"\']+\.m3u8[^\s"\']*)', r'src=["\']([^"\']+\.mp4[^"\']*)["\']']:
-            m = re.findall(pat, html)
-            if m:
-                cap = cv2.VideoCapture(m[0])
-                if cap.isOpened():
-                    ret, frame = cap.read()
-                    cap.release()
-                    if ret:
-                        return frame
+        patterns = [
+            r'(https?://[^\s"\']+\.m3u8[^\s"\']*)',
+            r'src=["\']([^"\']+\.mp4[^"\']*)["\']',
+            # Static image patterns — ASU, CloudFront, webcam keywords
+            r'<img[^>]+src=["\']([^"\']+(?:hayden|webcam|cam|tempe)[^"\']+\.(?:jpg|jpeg|png))["\']',
+            r'(https?://[^\s"\']+\.cloudfront\.net/[^\s"\']+\.(?:jpg|jpeg|png))',
+        ]
+        for pat in patterns:
+            for candidate in re.findall(pat, html, flags=re.IGNORECASE):
+                if candidate.startswith("//"):
+                    candidate = "https:" + candidate
+                elif candidate.startswith("/"):
+                    candidate = "https://view.asu.edu" + candidate
+                frame = fetch_frame_from_url(candidate)
+                if frame is not None:
+                    return frame
     except Exception:
         pass
     return None
 
 
 def get_demo_frame() -> np.ndarray | None:
-    """Return a synthetic demo frame for cloud demo mode."""
-    # Try to fetch a static demo image via requests
+    """Return a static demo frame for cloud demo mode."""
     try:
         resp = requests.get(DEMO_IMAGE_URLS[0], timeout=8)
-        arr  = np.frombuffer(resp.content, np.uint8)
-        img  = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        img = _decode_image_bytes(resp.content)
         if img is not None:
             return img
     except Exception:
         pass
-    # Last resort: generate a synthetic grey frame with text
+    # Last resort: synthetic grey frame with ASCII-safe text (OpenCV can't draw em-dashes)
     frame = np.full((480, 854, 3), 30, dtype=np.uint8)
-    cv2.putText(frame, "ASU Mobility Vision — Demo Mode",
+    cv2.putText(frame, "ASU Mobility Vision - Demo Mode",
                 (60, 240), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (160,160,200), 2)
     return frame
+
+
+# ── Source dispatcher ─────────────────────────────────────────────────────────
+
+@st.cache_resource(show_spinner=False)
+def _open_video_capture(path: str) -> cv2.VideoCapture:
+    return cv2.VideoCapture(path)
+
+
+def get_source_frame() -> tuple[np.ndarray | None, str]:
+    """
+    Dispatch based on source_mode. Returns (frame, source_label).
+    """
+    mode = st.session_state.get("source_mode", "ASU Live (best-effort)")
+
+    if mode == "Uploaded video":
+        path = st.session_state.get("uploaded_video_path")
+        if path and Path(path).exists():
+            cap = _open_video_capture(path)
+            if cap.isOpened():
+                ret, frame = cap.read()
+                if not ret:
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)  # loop the video
+                    ret, frame = cap.read()
+                if ret:
+                    return frame, "UPLOADED VIDEO"
+        return get_demo_frame(), "DEMO (no upload)"
+
+    if mode == "Custom URL (image or stream)":
+        url = (st.session_state.get("custom_url") or "").strip()
+        if url:
+            frame = fetch_frame_from_url(url)
+            if frame is not None:
+                label = "CUSTOM · STREAM" if _is_stream_url(url) else "CUSTOM · IMAGE"
+                return frame, label
+        return get_demo_frame(), "DEMO (no URL)"
+
+    # Default: ASU Live best-effort
+    frame = try_live_stream(ASU_STREAM_URL)
+    if frame is not None:
+        return frame, "LIVE · ASU HAYDEN"
+    return get_demo_frame(), "DEMO FRAME"
 
 
 def process_frame(frame_bgr, model, conf, use_tracker):
@@ -164,18 +305,49 @@ def process_frame(frame_bgr, model, conf, use_tracker):
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("## 🎛️ Control Panel")
-    st.markdown('<div class="info-box">🌐 <strong>Cloud Demo</strong><br>Using pretrained YOLOv8n + ASU live stream (falls back to demo frame if stream is unavailable).</div>', unsafe_allow_html=True)
+    st.markdown('<div class="info-box">🌐 <strong>Cloud Demo</strong><br>Pick a video source below, then press <strong>Start</strong>. ASU Live is best-effort (their page is a JS SPA and may not yield a direct URL).</div>', unsafe_allow_html=True)
     st.markdown("---")
 
+    st.markdown('<div class="section-title">Video Source</div>', unsafe_allow_html=True)
+    SOURCE_OPTIONS = ["ASU Live (best-effort)", "Custom URL (image or stream)", "Uploaded video"]
+    st.session_state.source_mode = st.radio(
+        "Source",
+        SOURCE_OPTIONS,
+        index=SOURCE_OPTIONS.index(st.session_state.get("source_mode", SOURCE_OPTIONS[0])),
+        label_visibility="collapsed",
+    )
+
+    if st.session_state.source_mode == "Custom URL (image or stream)":
+        st.session_state.custom_url = st.text_input(
+            "URL",
+            value=st.session_state.get("custom_url", ""),
+            placeholder="https://…/hayden.m3u8   or   https://…/latest.jpg",
+            help=("Accepts direct images (.jpg/.png/.webp) or live streams "
+                  "(.m3u8 HLS, .mpd DASH, .mp4, .ts, rtsp://). "
+                  "Find the URL in DevTools → Network → filter by 'Media' or '.m3u8'."),
+        )
+    elif st.session_state.source_mode == "Uploaded video":
+        uploaded = st.file_uploader("Upload mp4 / mov / avi", type=["mp4", "mov", "avi", "mkv"])
+        if uploaded is not None:
+            suffix = Path(uploaded.name).suffix or ".mp4"
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+            tmp.write(uploaded.read())
+            tmp.flush()
+            tmp.close()
+            st.session_state.uploaded_video_path = tmp.name
+            st.success(f"Loaded: {uploaded.name}")
+
+    st.markdown("---")
     st.markdown('<div class="section-title">Detection Settings</div>', unsafe_allow_html=True)
     st.session_state.conf_threshold = st.slider("Confidence Threshold", 0.20, 0.80, 0.40, 0.05)
-    use_tracker  = st.toggle("SORT Object Tracking", value=True)
-    st.session_state.show_heatmap   = st.toggle("Density Heatmap",  value=False)
-    st.session_state.show_track_ids = st.toggle("Show Track IDs",   value=True)
-    target_fps   = st.slider("Target FPS", 1, 10, 3)
+    st.session_state.use_tracker    = st.toggle("SORT Object Tracking", value=st.session_state.get("use_tracker", True))
+    st.session_state.show_heatmap   = st.toggle("Density Heatmap",  value=st.session_state.get("show_heatmap", False))
+    st.session_state.show_track_ids = st.toggle("Show Track IDs",   value=st.session_state.get("show_track_ids", True))
+    st.session_state.target_fps     = st.slider("Target FPS (hint)", 1, 4, st.session_state.get("target_fps", 1),
+                                                help="Streamlit Cloud CPU caps practical rate around 1–2 FPS for YOLOv8n.")
 
     st.markdown('<div class="section-title">Congestion Window</div>', unsafe_allow_html=True)
-    window_sec = st.slider("Rolling Window (sec)", 10, 120, 60, 10)
+    st.session_state.window_sec = st.slider("Rolling Window (sec)", 10, 120, st.session_state.get("window_sec", 60), 10)
 
     st.markdown("---")
     col_run, col_stop = st.columns(2)
@@ -186,14 +358,14 @@ with st.sidebar:
             except Exception as e:
                 st.error(f"Model load failed: {e}")
                 st.stop()
-            if use_tracker:
+            if st.session_state.use_tracker:
                 from utils.tracker import SORTTracker, KalmanBoxTracker
                 KalmanBoxTracker.count = 0
                 st.session_state.tracker = SORTTracker()
             else:
                 st.session_state.tracker = None
             LOG_DIR.mkdir(exist_ok=True)
-            st.session_state.congestion  = CongestionTracker(window_seconds=window_sec, log_dir=str(LOG_DIR))
+            st.session_state.congestion  = CongestionTracker(window_seconds=st.session_state.window_sec, log_dir=str(LOG_DIR))
             st.session_state.running     = True
             st.session_state.start_time  = time.time()
             st.session_state.frame_idx   = 0
@@ -294,83 +466,81 @@ def r_pie(c, walkers, wheeled):
     c.plotly_chart(fig, use_container_width=True)
 
 
-# ── Main loop ─────────────────────────────────────────────────────────────────
-if st.session_state.running:
+# ── Main loop (runs as a Streamlit fragment — panel-scoped refresh, no flicker) ─
+@st.fragment(run_every="1s")
+def video_step():
+    """One detection tick. Fragment re-runs every 1s without re-rendering the whole page."""
+    if not st.session_state.running:
+        return
+
     model = st.session_state.model
     cong  = st.session_state.congestion
+    if model is None or cong is None:
+        return
 
-    # Grab frame — try live stream first, fall back to demo
-    frame = try_live_stream(ASU_STREAM_URL)
-    src_label = "LIVE · ASU HAYDEN" if frame is not None else "DEMO FRAME"
+    frame, src_label = get_source_frame()
     if frame is None:
-        frame = get_demo_frame()
+        video_ph.warning("⚠️ No frame available — check your source selection.")
+        return
 
-    if frame is not None and model is not None:
-        annotated, walkers, wheeled, dets = process_frame(
-            frame, model, st.session_state.conf_threshold, use_tracker)
+    annotated, walkers, wheeled, dets = process_frame(
+        frame, model, st.session_state.conf_threshold, st.session_state.use_tracker)
 
-        st.session_state.det_history.append(dets)
+    st.session_state.det_history.append(dets)
 
-        if st.session_state.show_heatmap and len(st.session_state.det_history) > 5:
-            annotated = build_heatmap(annotated, list(st.session_state.det_history))
+    if st.session_state.show_heatmap and len(st.session_state.det_history) > 5:
+        annotated = build_heatmap(annotated, list(st.session_state.det_history))
 
-        metrics  = cong.update(walkers, wheeled)
-        annotated = draw_hud(annotated, walkers=walkers, wheeled=wheeled,
-                             score=metrics["score"], status=metrics["status"],
-                             source_label=src_label, rolling_avg=metrics["rolling_avg_score"])
+    metrics  = cong.update(walkers, wheeled)
+    annotated = draw_hud(annotated, walkers=walkers, wheeled=wheeled,
+                         score=metrics["score"], status=metrics["status"],
+                         source_label=src_label, rolling_avg=metrics["rolling_avg_score"])
 
-        video_ph.image(cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB),
-                       channels="RGB", use_container_width=True)
+    video_ph.image(cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB),
+                   channels="RGB", use_container_width=True)
 
-        r_metric(walker_ph,  walkers, "Walkers 🚶",  "#40dc9f")
-        r_metric(wheeled_ph, wheeled, "Wheeled 🚲",  "#ffb830")
-        score_ph.markdown(f'<div class="metric-card"><div class="score-ring">{metrics["score"]}</div>'
-                          f'<div class="metric-label">Congestion Score</div></div>', unsafe_allow_html=True)
-        r_status(status_ph, metrics["status"])
+    r_metric(walker_ph,  walkers, "Walkers 🚶",  "#40dc9f")
+    r_metric(wheeled_ph, wheeled, "Wheeled 🚲",  "#ffb830")
+    score_ph.markdown(f'<div class="metric-card"><div class="score-ring">{metrics["score"]}</div>'
+                      f'<div class="metric-label">Congestion Score</div></div>', unsafe_allow_html=True)
+    r_status(status_ph, metrics["status"])
 
-        rolling_ph.markdown(
-            f'<div class="metric-card"><div style="font-size:1.8rem;font-weight:700;color:#c4b5fd">'
-            f'{metrics["rolling_avg_score"]}</div>'
-            f'<div class="metric-label">Rolling Avg ({window_sec}s)</div></div>',
-            unsafe_allow_html=True)
+    rolling_ph.markdown(
+        f'<div class="metric-card"><div style="font-size:1.8rem;font-weight:700;color:#c4b5fd">'
+        f'{metrics["rolling_avg_score"]}</div>'
+        f'<div class="metric-label">Rolling Avg ({st.session_state.window_sec}s)</div></div>',
+        unsafe_allow_html=True)
 
-        pred = cong.predict_congestion(300)
-        if pred["predicted_score"] is not None:
-            icon = {"increasing":"📈","decreasing":"📉","stable":"➡️"}.get(pred["trend"],"➡️")
-            predict_ph.markdown(
-                f'<div class="metric-card">'
-                f'<div style="font-size:.75rem;color:#5b6a82;text-transform:uppercase;letter-spacing:1px">5-min Forecast</div>'
-                f'<div style="font-size:1.5rem;font-weight:700;color:#f9a8d4">{pred["predicted_score"]}</div>'
-                f'<div style="font-size:.8rem;color:#8892a4">{icon} {pred["trend"].capitalize()} · {pred["predicted_status"]}</div>'
-                f'</div>', unsafe_allow_html=True)
+    pred = cong.predict_congestion(300)
+    if pred["predicted_score"] is not None:
+        icon = {"increasing":"📈","decreasing":"📉","stable":"➡️"}.get(pred["trend"],"➡️")
+        predict_ph.markdown(
+            f'<div class="metric-card">'
+            f'<div style="font-size:.75rem;color:#5b6a82;text-transform:uppercase;letter-spacing:1px">5-min Forecast</div>'
+            f'<div style="font-size:1.5rem;font-weight:700;color:#f9a8d4">{pred["predicted_score"]}</div>'
+            f'<div style="font-size:.8rem;color:#8892a4">{icon} {pred["trend"].capitalize()} · {pred["predicted_status"]}</div>'
+            f'</div>', unsafe_allow_html=True)
 
-        elapsed = int(time.time() - (st.session_state.start_time or time.time()))
-        session_ph.markdown(
-            f'<div style="font-size:.82rem;color:#5b6a82;line-height:1.8">'
-            f'⏱ {elapsed}s &nbsp;|&nbsp; 🎞 Frame #{st.session_state.frame_idx}<br>'
-            f'📊 {metrics["window_size"]} samples in window<br>'
-            f'🔗 Source: {src_label}</div>', unsafe_allow_html=True)
+    elapsed = int(time.time() - (st.session_state.start_time or time.time()))
+    session_ph.markdown(
+        f'<div style="font-size:.82rem;color:#5b6a82;line-height:1.8">'
+        f'⏱ {elapsed}s &nbsp;|&nbsp; 🎞 Frame #{st.session_state.frame_idx}<br>'
+        f'📊 {metrics["window_size"]} samples in window<br>'
+        f'🔗 Source: {src_label}</div>', unsafe_allow_html=True)
 
-        new_row = pd.DataFrame([{"time": metrics["elapsed_seconds"],
-                                  "score": metrics["score"],
-                                  "walkers": walkers, "wheeled": wheeled}])
-        st.session_state.history_df = pd.concat(
-            [st.session_state.history_df, new_row], ignore_index=True).tail(500)
-        st.session_state.frame_idx += 1
+    new_row = pd.DataFrame([{"time": metrics["elapsed_seconds"],
+                              "score": metrics["score"],
+                              "walkers": walkers, "wheeled": wheeled}])
+    st.session_state.history_df = pd.concat(
+        [st.session_state.history_df, new_row], ignore_index=True).tail(500)
+    st.session_state.frame_idx += 1
 
-        r_chart(chart_ph, st.session_state.history_df)
-        r_pie(pie_ph, walkers, wheeled)
+    r_chart(chart_ph, st.session_state.history_df)
+    r_pie(pie_ph, walkers, wheeled)
 
-        if metrics["status"] == "HIGH":
-            st.toast(f"🔴 HIGH congestion! Score: {metrics['score']}", icon="🚨")
 
-        time.sleep(1.0 / max(target_fps, 1))
-        st.rerun()
-
-    else:
-        video_ph.warning("⚠️ Cannot load frame — check stream or demo fallback.")
-        time.sleep(2); st.rerun()
-
+if st.session_state.running:
+    video_step()
 else:
     video_ph.markdown("""
     <div style="background:linear-gradient(135deg,rgba(167,139,250,.08),rgba(96,165,250,.05));
