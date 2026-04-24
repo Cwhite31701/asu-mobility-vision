@@ -37,7 +37,7 @@ STATUS_EMOJI      = {"LOW": "🟢", "MEDIUM": "🟡", "HIGH": "🔴"}
 
 # Demo image URLs (ASU campus stock — used as cloud fallback)
 DEMO_IMAGE_URLS = [
-    "https://upload.wikimedia.org/wikipedia/commons/thumb/2/22/ASU_Hayden_Library.jpg/1280px-ASU_Hayden_Library.jpg",
+    "https://b-117b36f5.kinesisvideo.us-west-2.amazonaws.com/hls/v1/getHLSMediaPlaylist.m3u8?SessionToken=CiBYIXWN98f32H0XsJIoPGt_jm2e_EtuFhHbWWb2an7d7hIQ539FFZBT9FQCmp65ZGyAJxoZW3Inqv4kSM4ImX2kS1Xg3esnSYWPsbfOQSIgLW6yBJG0OMrLlZkYxyQk3NAjdWdFGhjGntY86UmFnr0~&TrackNumber=1",
 ]
 
 # ── Page config ───────────────────────────────────────────────────────────────
