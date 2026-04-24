@@ -30,7 +30,7 @@ def draw_detections(
     frame: np.ndarray,
     detections: list[dict],
     show_conf: bool = True,
-    show_track_id: bool = True,
+    show_track_ids: bool = True,
 ) -> np.ndarray:
     """
     Draw bounding boxes and labels on a frame.
@@ -64,7 +64,7 @@ def draw_detections(
         tag_parts = [label]
         if show_conf:
             tag_parts.append(f"{conf:.0%}")
-        if show_track_id and track_id is not None:
+        if show_track_ids and track_id is not None:
             tag_parts.append(f"#{track_id}")
         tag = " ".join(tag_parts)
 
