@@ -1,19 +1,24 @@
 """
 streamlit_app.py — ASU Mobility Vision (Streamlit Cloud entry point)
-
 Cloud-safe version:
   • Uses pretrained YOLOv8n (auto-downloaded by ultralytics)
   • Pulls live ASU Hayden webcam or falls back to graceful demo
   • No local video files required
-"""
 
+CHANGES vs. previous version:
+  • Large-file upload support (tested with 2.3 GB MP4). Requires matching
+    .streamlit/config.toml with `maxUploadSize = 4000` (see README).
+  • Uploader now streams to disk in 16 MB chunks instead of slurping the
+    whole file into RAM — prevents OOM on multi-GB videos.
+  • Shows a progress bar while saving, plus the final on-disk size.
+"""
 import os
 import sys
 import time
+import shutil
 import tempfile
 from pathlib import Path
 from collections import deque
-
 # Tell FFmpeg (cv2.VideoCapture's backend) to impersonate a browser when
 # fetching HLS from the ASU/Kinesis endpoints. AWS Kinesis Video's HLS host
 # occasionally rejects plain Python clients; setting Referer + User-Agent
@@ -24,7 +29,6 @@ os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
     "|user_agent;Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36"
 )
-
 import cv2
 import numpy as np
 import streamlit as st
@@ -34,12 +38,10 @@ import requests
 import urllib.request
 import ssl
 import re
-
 # ── Ensure utils is importable ────────────────────────────────────────────────
 sys.path.insert(0, str(Path(__file__).parent))
 from utils.congestion import CongestionTracker
 from utils.overlay import draw_detections, draw_hud, build_heatmap
-
 # ── Constants ─────────────────────────────────────────────────────────────────
 MODEL_NAME        = "yolov8n.pt"          # downloaded automatically if absent
 ASU_STREAM_URL    = "https://view.asu.edu/tempe/hayden"
@@ -56,12 +58,27 @@ ASU_HLS_URL = (
 HEATMAP_HISTORY   = 40
 LOG_DIR           = Path("logs")
 STATUS_EMOJI      = {"LOW": "🟢", "MEDIUM": "🟡", "HIGH": "🔴"}
-
+# Persistent uploads dir — survives across reruns (tempfile is usually /tmp
+# which is fine, but we want a predictable location so we can clean up).
+UPLOADS_DIR = Path(tempfile.gettempdir()) / "asu_mobility_uploads"
+UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+# How much we read from the browser per write when streaming a large upload.
+# 16 MB is a good balance: big enough to keep syscalls cheap, small enough
+# that RAM never holds more than one chunk at a time.
+UPLOAD_CHUNK = 16 * 1024 * 1024  # 16 MiB
+# Pre-filled default for "Local file (path on disk)" mode.
+# This is the 1.9 GB ASU screen recording that was uploaded to this session.
+# Edit or override via the sidebar text field — the value just primes the input.
+DEFAULT_LOCAL_VIDEO_PATH = (
+    "/Users/chandler.white/Library/Application Support/Claude/"
+    "local-agent-mode-sessions/8c626775-a4e7-4ece-82fb-1c69f7ac96f9/"
+    "66e5ccce-0196-47c6-bd93-3c8a9797a9a7/local_85a51602-9a66-4232-adec-4f80dce99484/"
+    "uploads/Screen Recording 2026-04-23 at 8.35.19 PM.mov"
+)
 # Demo image URLs (ASU campus stock — used as cloud fallback)
 DEMO_IMAGE_URLS = [
     "https://upload.wikimedia.org/wikipedia/commons/thumb/2/22/ASU_Hayden_Library.jpg/1280px-ASU_Hayden_Library.jpg",
 ]
-
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="ASU Mobility Vision",
@@ -69,7 +86,6 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
-
 st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
@@ -95,8 +111,6 @@ html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
     border-radius:12px; padding:16px; font-size:.85rem; color:#8892a4; margin-bottom:12px;}
 </style>
 """, unsafe_allow_html=True)
-
-
 # ── Session state ─────────────────────────────────────────────────────────────
 def init_state():
     defaults = {
@@ -106,10 +120,17 @@ def init_state():
         "frame_idx": 0, "start_time": None,
         "show_heatmap": False, "show_track_ids": True,
         "conf_threshold": 0.40, "cap": None,
-        # NEW: source routing
-        "source_mode": "ASU Live (best-effort)",
+        # NEW: source routing — default to the local .mov so the app plays it
+        # as soon as the user hits Start. Change to "ASU Live (best-effort)"
+        # if you'd rather have the webcam be the default.
+        "source_mode": "Local file (path on disk)",
         "custom_url": "",
         "uploaded_video_path": None,
+        "uploaded_video_name": None,
+        "uploaded_video_signature": None,   # (filename, size) so we don't re-save the same file every rerun
+        # Local-file mode — direct path on disk, no upload widget.
+        # Perfect for multi-GB videos that would be painful to push through the browser.
+        "local_video_path": DEFAULT_LOCAL_VIDEO_PATH,
         "use_tracker": True,
         "target_fps": 1,
         "window_sec": 60,
@@ -123,16 +144,11 @@ def init_state():
     for k, v in defaults.items():
         if k not in st.session_state:
             st.session_state[k] = v
-
 init_state()
-
-
 @st.cache_resource(show_spinner="Downloading YOLOv8n… (first run only)")
 def load_model():
     from ultralytics import YOLO
     return YOLO(MODEL_NAME)
-
-
 def _fetch_url_bytes(url: str, timeout: int = 8) -> bytes | None:
     """HTTP GET with ASU-friendly headers; returns bytes or None."""
     try:
@@ -144,16 +160,12 @@ def _fetch_url_bytes(url: str, timeout: int = 8) -> bytes | None:
             return r.read()
     except Exception:
         return None
-
-
 def _decode_image_bytes(data: bytes) -> np.ndarray | None:
     try:
         arr = np.frombuffer(data, np.uint8)
         return cv2.imdecode(arr, cv2.IMREAD_COLOR)
     except Exception:
         return None
-
-
 def _is_stream_url(url: str) -> bool:
     """True if the URL looks like a video stream (HLS/DASH/MP4/TS/RTSP)."""
     if not url:
@@ -162,8 +174,6 @@ def _is_stream_url(url: str) -> bool:
     if url.lower().startswith(("rtsp://", "rtmp://")):
         return True
     return any(path.endswith(ext) for ext in (".m3u8", ".mpd", ".mp4", ".ts", ".m4s"))
-
-
 def _get_or_open_stream_cap(url: str) -> cv2.VideoCapture | None:
     """
     Cache a VideoCapture per URL in session state so we don't reconnect
@@ -182,8 +192,6 @@ def _get_or_open_stream_cap(url: str) -> cv2.VideoCapture | None:
         return new_cap
     except Exception:
         return None
-
-
 def fetch_frame_from_url(url: str) -> np.ndarray | None:
     """
     Fetch one frame from a URL. Handles:
@@ -212,46 +220,36 @@ def fetch_frame_from_url(url: str) -> np.ndarray | None:
     if data is None:
         return None
     return _decode_image_bytes(data)
-
-
 def record_hls_clip(url: str, out_path: str, duration_sec: int = 120) -> tuple[bool, str, int]:
     """
     Record ~duration_sec of live video from an HLS / MP4 / stream URL to an MP4 on disk.
     Designed for the ASU Kinesis HLS feed (tokens expire ~5–10 min, so keep clips short).
-
     Returns (ok, message, frames_written).
-
     UX: shows a Streamlit progress bar. Streamlit's event loop is blocked for the
     duration — don't touch other controls while recording.
     """
     cap = cv2.VideoCapture(url)
     if not cap.isOpened():
         return False, "Could not open stream — token may have expired. Grab a fresh .m3u8 URL.", 0
-
     # Probe first frame so we know geometry + that the stream is actually live
     ok_first, first = cap.read()
     if not ok_first or first is None:
         cap.release()
         return False, "Stream opened but no frames came through. Token likely expired.", 0
-
     h, w = first.shape[:2]
     src_fps = cap.get(cv2.CAP_PROP_FPS)
     fps = src_fps if (src_fps and 1 <= src_fps <= 60) else 5.0  # ASU cam is typically ~5 fps
-
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(out_path, fourcc, fps, (w, h))
     if not writer.isOpened():
         cap.release()
         return False, f"Could not open writer for {out_path}", 0
-
     writer.write(first)  # don't waste the frame we probed
-
     progress  = st.progress(0.0, text=f"Recording 0 / {duration_sec}s …")
     deadline  = time.time() + duration_sec
     start_t   = time.time()
     frames    = 1
     stall_ct  = 0  # consecutive read failures
-
     while time.time() < deadline:
         ret, frame = cap.read()
         if not ret or frame is None:
@@ -269,16 +267,12 @@ def record_hls_clip(url: str, out_path: str, duration_sec: int = 120) -> tuple[b
             pct,
             text=f"Recording {int(elapsed)} / {duration_sec}s  ·  {frames} frames @ {frames/max(elapsed,0.1):.1f} fps",
         )
-
     cap.release()
     writer.release()
     progress.empty()
-
     if frames < int(fps * 2):            # fewer than ~2s of video actually captured
         return False, f"Only captured {frames} frames before the stream died. Try a fresher token.", frames
     return True, f"Saved {frames} frames ({frames/fps:.0f}s @ {fps:.0f} fps) to {out_path}", frames
-
-
 def try_live_stream(page_url: str) -> np.ndarray | None:
     """
     Best-effort ASU live-cam fetch. The ASU Views site is a JS SPA, so the
@@ -312,8 +306,6 @@ def try_live_stream(page_url: str) -> np.ndarray | None:
     except Exception:
         pass
     return None
-
-
 def get_demo_frame() -> np.ndarray | None:
     """Return a static demo frame for cloud demo mode."""
     try:
@@ -328,21 +320,84 @@ def get_demo_frame() -> np.ndarray | None:
     cv2.putText(frame, "ASU Mobility Vision - Demo Mode",
                 (60, 240), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (160,160,200), 2)
     return frame
+# ── Large-file upload helper ──────────────────────────────────────────────────
+def _human_bytes(n: int) -> str:
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return f"{n:.1f} {unit}" if unit != "B" else f"{n} {unit}"
+        n /= 1024.0
+    return f"{n:.1f} TB"
+def save_uploaded_video_streaming(uploaded_file) -> str:
+    """
+    Persist an UploadedFile to disk by streaming it in chunks. Returns the
+    absolute path.
 
+    Why streaming (vs. `tmp.write(uploaded.read())`):
+      • `uploaded.read()` returns the *whole* file as a bytes object, which
+        for a 2.3 GB clip means peak RAM ≈ 2.3 GB just for that one call.
+        On Streamlit Cloud's free tier (~1 GB RAM) you OOM instantly.
+      • Streaming in 16 MB chunks keeps steady-state RAM flat at ~16 MB.
 
+    UX: shows a progress bar based on `uploaded_file.size` (Streamlit
+    populates this up front from the multipart header).
+    """
+    suffix = Path(uploaded_file.name).suffix or ".mp4"
+    # Keep the original name visible in the path so debugging is easier than
+    # opaque tempfile names like "tmp1a2b3c.mp4".
+    safe_stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", Path(uploaded_file.name).stem) or "upload"
+    out_path = UPLOADS_DIR / f"{int(time.time())}_{safe_stem}{suffix}"
+
+    total = int(getattr(uploaded_file, "size", 0) or 0)
+    written = 0
+    progress = st.progress(0.0, text="Starting upload…")
+
+    # Rewind in case the widget has been read before (e.g. a previous rerun).
+    try:
+        uploaded_file.seek(0)
+    except Exception:
+        pass
+
+    try:
+        with open(out_path, "wb") as f:
+            while True:
+                chunk = uploaded_file.read(UPLOAD_CHUNK)
+                if not chunk:
+                    break
+                f.write(chunk)
+                written += len(chunk)
+                if total:
+                    pct = min(1.0, written / total)
+                    progress.progress(
+                        pct,
+                        text=f"Saving video… {_human_bytes(written)} / {_human_bytes(total)}  ({pct*100:.1f}%)",
+                    )
+                else:
+                    progress.progress(
+                        0.5, text=f"Saving video… {_human_bytes(written)} written"
+                    )
+        progress.progress(1.0, text=f"Saved {_human_bytes(written)}")
+    except Exception:
+        # Don't leave a half-written file behind — it will crash VideoCapture.
+        progress.empty()
+        try:
+            out_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        raise
+    finally:
+        time.sleep(0.2)  # let the progress bar land on 100%
+        progress.empty()
+
+    return str(out_path)
 # ── Source dispatcher ─────────────────────────────────────────────────────────
-
 @st.cache_resource(show_spinner=False)
 def _open_video_capture(path: str) -> cv2.VideoCapture:
     return cv2.VideoCapture(path)
-
-
 def get_source_frame() -> tuple[np.ndarray | None, str]:
     """
     Dispatch based on source_mode. Returns (frame, source_label).
     """
     mode = st.session_state.get("source_mode", "ASU Live (best-effort)")
-
     if mode == "Uploaded video":
         path = st.session_state.get("uploaded_video_path")
         if path and Path(path).exists():
@@ -355,7 +410,18 @@ def get_source_frame() -> tuple[np.ndarray | None, str]:
                 if ret:
                     return frame, "UPLOADED VIDEO"
         return get_demo_frame(), "DEMO (no upload)"
-
+    if mode == "Local file (path on disk)":
+        path = (st.session_state.get("local_video_path") or "").strip()
+        if path and Path(path).exists():
+            cap = _open_video_capture(path)
+            if cap.isOpened():
+                ret, frame = cap.read()
+                if not ret:
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)  # loop the video
+                    ret, frame = cap.read()
+                if ret:
+                    return frame, f"LOCAL FILE · {Path(path).name}"
+        return get_demo_frame(), "DEMO (bad local path)"
     if mode == "Custom URL (image or stream)":
         url = (st.session_state.get("custom_url") or "").strip()
         if url:
@@ -364,7 +430,6 @@ def get_source_frame() -> tuple[np.ndarray | None, str]:
                 label = "CUSTOM STREAM" if _is_stream_url(url) else "CUSTOM IMAGE"
                 return frame, label
         return get_demo_frame(), "DEMO (no URL)"
-
     # Default: ASU Live best-effort.
     # 1) Try the known AWS Kinesis HLS endpoint directly — this is the real feed.
     frame = fetch_frame_from_url(ASU_HLS_URL)
@@ -376,8 +441,6 @@ def get_source_frame() -> tuple[np.ndarray | None, str]:
         return frame, "LIVE ASU HAYDEN"
     # 3) Last resort: demo image so the dashboard still has something to show.
     return get_demo_frame(), "DEMO FRAME"
-
-
 # Speed-mode presets: (YOLO input size, run-inference-every-N-ticks, chart-refresh-every-N-ticks)
 # Smaller imgsz → faster; bigger N → fewer expensive calls per second.
 SPEED_PRESETS = {
@@ -385,8 +448,6 @@ SPEED_PRESETS = {
     "Balanced":     {"imgsz": 416, "infer_every": 2, "chart_every": 5},
     "Fastest":      {"imgsz": 320, "infer_every": 3, "chart_every": 8},
 }
-
-
 def run_yolo_inference(frame_bgr, model, conf, use_tracker, imgsz):
     """Run YOLO + (optional) SORT tracker. Returns (walkers, wheeled, display_dets)."""
     results = model(frame_bgr, conf=conf, verbose=False, imgsz=imgsz)[0]
@@ -405,23 +466,24 @@ def run_yolo_inference(frame_bgr, model, conf, use_tracker, imgsz):
     walkers = sum(1 for d in display_dets if d.get("cls_id", 0) == 0)
     wheeled = sum(1 for d in display_dets if d.get("cls_id", 0) == 1)
     return walkers, wheeled, display_dets
-
-
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("## 🎛️ Control Panel")
-    st.markdown('<div class="info-box">🌐 <strong>Cloud Demo</strong><br>Pick a video source below, then press <strong>Start</strong>. <strong>ASU Live</strong> uses the baked-in HLS feed; if the AWS session token expires, paste a fresh <code>.m3u8</code> URL into <strong>Custom URL</strong>.</div>', unsafe_allow_html=True)
+    st.markdown('<div class="info-box">🌐 <strong>Cloud Demo</strong><br>Pick a video source below, then press <strong>Start</strong>. <strong>ASU Live</strong> uses the baked-in HLS feed; if the AWS session token expires, paste a fresh <code>.m3u8</code> URL into <strong>Custom URL</strong>.<br><br>⚠️ <strong>Large uploads:</strong> the app is configured for files up to ~4 GB. Make sure <code>.streamlit/config.toml</code> ships with <code>maxUploadSize = 4000</code>, otherwise Streamlit will reject the 2.3 GB file with a 413.</div>', unsafe_allow_html=True)
     st.markdown("---")
-
     st.markdown('<div class="section-title">Video Source</div>', unsafe_allow_html=True)
-    SOURCE_OPTIONS = ["ASU Live (best-effort)", "Custom URL (image or stream)", "Uploaded video"]
+    SOURCE_OPTIONS = [
+        "ASU Live (best-effort)",
+        "Custom URL (image or stream)",
+        "Uploaded video",
+        "Local file (path on disk)",
+    ]
     st.session_state.source_mode = st.radio(
         "Source",
         SOURCE_OPTIONS,
         index=SOURCE_OPTIONS.index(st.session_state.get("source_mode", SOURCE_OPTIONS[0])),
         label_visibility="collapsed",
     )
-
     if st.session_state.source_mode == "Custom URL (image or stream)":
         st.session_state.custom_url = st.text_input(
             "URL",
@@ -432,16 +494,83 @@ with st.sidebar:
                   "Find the URL in DevTools → Network → filter by 'Media' or '.m3u8'."),
         )
     elif st.session_state.source_mode == "Uploaded video":
-        uploaded = st.file_uploader("Upload mp4 / mov / avi", type=["mp4", "mov", "avi", "mkv"])
+        uploaded = st.file_uploader(
+            "Upload mp4 / mov / avi (up to ~4 GB)",
+            type=["mp4", "mov", "avi", "mkv"],
+            accept_multiple_files=False,
+            help=(
+                "Streaming upload — large files (e.g. 2.3 GB) are saved to disk in "
+                "16 MB chunks so RAM stays flat. Upload speed is network-bound; "
+                "a 2.3 GB file on a 100 Mbps link takes ~3 minutes."
+            ),
+        )
         if uploaded is not None:
-            suffix = Path(uploaded.name).suffix or ".mp4"
-            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
-            tmp.write(uploaded.read())
-            tmp.flush()
-            tmp.close()
-            st.session_state.uploaded_video_path = tmp.name
-            st.success(f"Loaded: {uploaded.name}")
+            # Fingerprint (name, size) so we don't re-save on every rerun —
+            # Streamlit reruns the whole script on every widget interaction.
+            sig = (uploaded.name, int(getattr(uploaded, "size", 0) or 0))
+            if st.session_state.get("uploaded_video_signature") != sig:
+                try:
+                    path = save_uploaded_video_streaming(uploaded)
+                    st.session_state.uploaded_video_path      = path
+                    st.session_state.uploaded_video_name      = uploaded.name
+                    st.session_state.uploaded_video_signature = sig
+                    # Invalidate the cached VideoCapture so the new file is opened.
+                    _open_video_capture.clear()
+                    on_disk = Path(path).stat().st_size
+                    st.success(f"Loaded: {uploaded.name} ({_human_bytes(on_disk)})")
+                except Exception as e:
+                    st.error(f"Upload failed: {e}")
+            else:
+                # Same file as last rerun — just confirm it's still there.
+                p = st.session_state.get("uploaded_video_path")
+                if p and Path(p).exists():
+                    st.success(f"Loaded: {uploaded.name} ({_human_bytes(Path(p).stat().st_size)})")
 
+        # Offer a manual "clear" button so huge files don't linger across sessions.
+        if st.session_state.get("uploaded_video_path"):
+            if st.button("🗑 Clear uploaded video", use_container_width=True):
+                p = st.session_state.pop("uploaded_video_path", None)
+                st.session_state.pop("uploaded_video_name", None)
+                st.session_state.pop("uploaded_video_signature", None)
+                _open_video_capture.clear()
+                if p:
+                    try:
+                        Path(p).unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                st.rerun()
+    elif st.session_state.source_mode == "Local file (path on disk)":
+        # No upload, no copy — we just hand OpenCV an absolute path. Zero RAM
+        # overhead and works for any file size (10 GB, 50 GB, whatever your
+        # disk holds). Ideal when the video is already on the machine running
+        # Streamlit (i.e. running locally on your Mac).
+        new_path = st.text_input(
+            "Absolute path to video file",
+            value=st.session_state.get("local_video_path", DEFAULT_LOCAL_VIDEO_PATH),
+            help=(
+                "Paste the full path to an .mp4/.mov/.avi/.mkv file that already "
+                "exists on the machine running Streamlit. No upload happens — "
+                "OpenCV reads directly from disk, so file size is effectively "
+                "unlimited. Pre-filled with the .mov from this session."
+            ),
+        )
+        # Only invalidate the cached VideoCapture if the path actually changed.
+        if new_path != st.session_state.get("local_video_path"):
+            st.session_state.local_video_path = new_path
+            _open_video_capture.clear()
+
+        p = Path(new_path) if new_path else None
+        if p and p.exists() and p.is_file():
+            try:
+                sz = p.stat().st_size
+                st.success(f"Found: {p.name} ({_human_bytes(sz)})")
+            except Exception:
+                st.success(f"Found: {p.name}")
+        elif new_path:
+            st.error(
+                f"No file at `{new_path}`. Check for typos — the path must be "
+                "absolute and readable by whichever user is running Streamlit."
+            )
     # ── Record-from-live helper ──────────────────────────────────────────────
     # Captures N seconds of the live HLS stream to a local MP4 so the demo
     # keeps working after the AWS SessionToken expires. Great for demo day:
@@ -454,7 +583,6 @@ with st.sidebar:
     with rec_c2:
         st.markdown("<br>", unsafe_allow_html=True)
         record_clicked = st.button("⏺ Record", use_container_width=True)
-
     if record_clicked:
         # Prefer the custom URL if the user pasted a fresh one; else use the baked HLS URL.
         rec_url = (st.session_state.get("custom_url") or "").strip() or ASU_HLS_URL
@@ -468,13 +596,15 @@ with st.sidebar:
                 st.success(msg)
                 # Drop any cached VideoCapture for the live URL so later plays don't collide
                 st.session_state.pop(f"_stream_cap::{rec_url}", None)
+                _open_video_capture.clear()
                 # Auto-switch to playback mode so pressing Start uses the clip
                 st.session_state.uploaded_video_path = out_path
+                st.session_state.uploaded_video_name = Path(out_path).name
+                st.session_state.uploaded_video_signature = (Path(out_path).name, Path(out_path).stat().st_size)
                 st.session_state.source_mode = "Uploaded video"
                 st.rerun()
             else:
                 st.error(msg)
-
     st.markdown("---")
     st.markdown('<div class="section-title">Detection Settings</div>', unsafe_allow_html=True)
     st.session_state.conf_threshold = st.slider("Confidence Threshold", 0.20, 0.80, 0.40, 0.05)
@@ -483,7 +613,6 @@ with st.sidebar:
     st.session_state.show_track_ids = st.toggle("Show Track IDs",   value=st.session_state.get("show_track_ids", True))
     st.session_state.target_fps     = st.slider("Target FPS (hint)", 1, 4, st.session_state.get("target_fps", 1),
                                                 help="Streamlit Cloud CPU caps practical rate around 1–2 FPS for YOLOv8n.")
-
     st.markdown('<div class="section-title">Performance</div>', unsafe_allow_html=True)
     st.session_state.speed_mode = st.radio(
         "Speed mode",
@@ -497,10 +626,8 @@ with st.sidebar:
             "Fastest: 320px, detection every 3 ticks. Snappy video, looser boxes."
         ),
     )
-
     st.markdown('<div class="section-title">Congestion Window</div>', unsafe_allow_html=True)
     st.session_state.window_sec = st.slider("Rolling Window (sec)", 10, 120, st.session_state.get("window_sec", 60), 10)
-
     st.markdown("---")
     col_run, col_stop = st.columns(2)
     with col_run:
@@ -531,7 +658,6 @@ with st.sidebar:
     with col_stop:
         if st.button("⏹ Stop", use_container_width=True):
             st.session_state.running = False
-
     st.markdown("---")
     st.markdown("""
     <div class="info-box">
@@ -542,7 +668,6 @@ with st.sidebar:
     🔴 <strong>High</strong> &gt; 12
     </div>
     """, unsafe_allow_html=True)
-
     # Log download
     log_files = sorted(LOG_DIR.glob("*.csv")) if LOG_DIR.exists() else []
     if log_files:
@@ -550,17 +675,12 @@ with st.sidebar:
             st.download_button("⬇ Download Session CSV", f,
                                file_name=log_files[-1].name,
                                mime="text/csv", use_container_width=True)
-
-
 # ── Header ────────────────────────────────────────────────────────────────────
 st.markdown("## 🏫 ASU Mobility Vision")
 st.markdown("*Real-time pedestrian & wheeled mobility detection · Hayden Library Zone · CIS 515*")
-
 main_col, side_col = st.columns([3, 1], gap="large")
-
 with main_col:
     video_ph = st.empty()
-
 with side_col:
     st.markdown('<div class="section-title">Live Counts</div>', unsafe_allow_html=True)
     walker_ph  = st.empty()
@@ -573,7 +693,6 @@ with side_col:
     predict_ph = st.empty()
     st.markdown("---")
     session_ph = st.empty()
-
 st.markdown("---")
 ch1, ch2 = st.columns([2, 1])
 with ch1:
@@ -582,18 +701,14 @@ with ch1:
 with ch2:
     st.markdown('<div class="section-title">Walker vs Wheeled Split</div>', unsafe_allow_html=True)
     pie_ph = st.empty()
-
-
 # ── Render helpers ────────────────────────────────────────────────────────────
 def r_metric(c, val, label, color):
     c.markdown(f'<div class="metric-card"><div class="metric-number" style="color:{color}">{val}</div>'
                f'<div class="metric-label">{label}</div></div>', unsafe_allow_html=True)
-
 def r_status(c, status):
     emoji = STATUS_EMOJI.get(status, "⚪")
     c.markdown(f'<div class="status-badge status-{status.lower()}">{emoji} {status}</div>',
                unsafe_allow_html=True)
-
 def r_chart(c, df):
     if df.empty or len(df) < 2:
         c.info("Collecting data…"); return
@@ -612,7 +727,6 @@ def r_chart(c, df):
         xaxis=dict(showgrid=False, title="Elapsed (s)"),
         yaxis=dict(showgrid=True, gridcolor="rgba(255,255,255,.05)"))
     c.plotly_chart(fig, use_container_width=True)
-
 def r_pie(c, walkers, wheeled):
     if walkers + wheeled == 0:
         c.info("No detections yet."); return
@@ -621,8 +735,6 @@ def r_pie(c, walkers, wheeled):
     fig.update_layout(paper_bgcolor="rgba(0,0,0,0)", font=dict(color="#8892a4",size=11),
         margin=dict(l=10,r=10,t=10,b=10), showlegend=False, height=240)
     c.plotly_chart(fig, use_container_width=True)
-
-
 # ── Main loop (runs as a Streamlit fragment — panel-scoped refresh, no flicker) ─
 #
 # Cadence strategy (for smooth playback on Streamlit Cloud's 1-vCPU free tier):
@@ -635,29 +747,23 @@ def r_pie(c, walkers, wheeled):
 def video_step():
     if not st.session_state.running:
         return
-
     model = st.session_state.model
     cong  = st.session_state.congestion
     if model is None or cong is None:
         return
-
     preset       = SPEED_PRESETS[st.session_state.get("speed_mode", "Balanced")]
     imgsz        = preset["imgsz"]
     infer_every  = preset["infer_every"]
     chart_every  = preset["chart_every"]
-
     tick = int(st.session_state.get("tick_count", 0))
     st.session_state.tick_count = tick + 1
-
     frame, src_label = get_source_frame()
     if frame is None:
         video_ph.warning("⚠️ No frame available — check your source selection.")
         return
-
     # Only run YOLO on an "inference tick" (or on the very first tick so we
     # have something to draw). Otherwise reuse cached detections.
     do_infer = (tick % infer_every == 0) or (st.session_state.get("last_dets") is None)
-
     if do_infer:
         walkers, wheeled, dets = run_yolo_inference(
             frame, model,
@@ -676,26 +782,21 @@ def video_step():
         metrics   = st.session_state.get("last_metrics")
         if metrics is None:                      # shouldn't happen, but guard
             return
-
     # Redraw boxes on the fresh frame (cheap) so the video always looks live.
     annotated = draw_detections(
         frame, dets, show_conf=True, show_track_ids=st.session_state.show_track_ids,
     )
-
     if st.session_state.show_heatmap and len(st.session_state.det_history) > 5:
         annotated = build_heatmap(annotated, list(st.session_state.det_history))
-
     annotated = draw_hud(
         annotated, walkers=walkers, wheeled=wheeled,
         score=metrics["score"], status=metrics["status"],
         source_label=src_label, rolling_avg=metrics["rolling_avg_score"],
     )
-
     video_ph.image(
         cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB),
         channels="RGB", use_container_width=True,
     )
-
     # Cheap DOM updates — run every tick.
     r_metric(walker_ph,  walkers, "Walkers 🚶",  "#40dc9f")
     r_metric(wheeled_ph, wheeled, "Wheeled 🚲",  "#ffb830")
@@ -708,7 +809,6 @@ def video_step():
         f'{metrics["rolling_avg_score"]}</div>'
         f'<div class="metric-label">Rolling Avg ({st.session_state.window_sec}s)</div></div>',
         unsafe_allow_html=True)
-
     elapsed = int(time.time() - (st.session_state.start_time or time.time()))
     session_ph.markdown(
         f'<div style="font-size:.82rem;color:#5b6a82;line-height:1.8">'
@@ -716,7 +816,6 @@ def video_step():
         f'📊 {metrics["window_size"]} samples in window<br>'
         f'🔗 Source: {src_label} &nbsp;|&nbsp; ⚙️ {st.session_state.speed_mode}</div>',
         unsafe_allow_html=True)
-
     # Only append a history row on real inference ticks — otherwise we'd
     # duplicate the same (walkers, wheeled) every 500ms and pollute the chart.
     if do_infer:
@@ -728,9 +827,7 @@ def video_step():
         st.session_state.history_df = pd.concat(
             [st.session_state.history_df, new_row], ignore_index=True,
         ).tail(500)
-
     st.session_state.frame_idx += 1
-
     # Expensive Plotly rebuilds — throttle to every chart_every ticks.
     if tick % chart_every == 0:
         pred = cong.predict_congestion(300)
@@ -744,8 +841,6 @@ def video_step():
                 f'</div>', unsafe_allow_html=True)
         r_chart(chart_ph, st.session_state.history_df)
         r_pie(pie_ph, walkers, wheeled)
-
-
 if st.session_state.running:
     video_step()
 else:
