@@ -2,7 +2,8 @@
 ultralytics>=8.2.0
 torch>=2.2.0
 torchvision>=0.17.0
-opencv-python-headless>=4.9.0.80
+# Note: ultralytics pins opencv-python (non-headless); keep system libs
+# (libgl1, libglib2.0-0t64) in packages.txt so its native module loads.
 
 # Dashboard
 streamlit>=1.32.0
